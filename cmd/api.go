@@ -1,31 +1,57 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 )
 
 // APIClient is a simple REST client for interacting with the API.
 type APIClient struct {
-	BaseURL string
-	APIKey  string
+	BaseURL    string
+	HTTPClient *http.Client
+	ProjectID  string
+	Logger     *log.Logger // Add a logger
 }
 
 // NewAPIClient creates a new APIClient.
 func NewAPIClient() *APIClient {
-	apiKey := os.Getenv("API_KEY")
-	if apiKey == "" {
-		panic("API_KEY environment variable not set")
-	}
 	baseURL := os.Getenv("BASE_URL")
 	if baseURL == "" {
 		panic("BASE_URL environment variable not set")
 	}
-	return &APIClient{BaseURL: baseURL, APIKey: apiKey}
+
+	projectID := os.Getenv("PROJECT_ID")
+	if projectID == "" {
+		panic("PROJECT_ID environment variable not set")
+	}
+
+	// Use Application Default Credentials (ADC) for authentication
+	// This will look for credentials in the environment variables,
+	// well-known file locations, or the metadata server.
+	// See: https://cloud.google.com/docs/authentication/application-default-credentials
+	ctx := context.Background()
+	credentials, err := google.FindDefaultCredentials(ctx, "https://www.googleapis.com/auth/cloud-platform")
+	if err != nil {
+		panic(fmt.Sprintf("Error finding default credentials: %v", err))
+	}
+
+	// Create an HTTP client that uses the token source from the credentials
+	httpClient := oauth2.NewClient(ctx, credentials.TokenSource)
+
+	// Create a logger
+	logger := log.New(os.Stderr, "APIClient: ", log.LstdFlags|log.Lshortfile)
+
+	return &APIClient{BaseURL: baseURL, HTTPClient: httpClient, ProjectID: projectID, Logger: logger}
 }
 
 // ListModels lists all models.
@@ -127,7 +153,6 @@ func (c *APIClient) CreateManifest(modelName, modelServerName, modelServerVersio
 		return nil, fmt.Errorf("error parsing URL: %w", err)
 	}
 	q := u.Query()
-	q.Set("key", c.APIKey)
 	q.Set("model_and_model_server_info.model_name", modelName)
 	q.Set("model_and_model_server_info.model_server_name", modelServerName)
 	q.Set("model_and_model_server_info.model_server_version", modelServerVersion)
@@ -136,8 +161,6 @@ func (c *APIClient) CreateManifest(modelName, modelServerName, modelServerVersio
 		q.Set("target_ntpot_milliseconds", fmt.Sprintf("%d", targetNtpotMilliseconds))
 	}
 	u.RawQuery = q.Encode()
-
-	// fmt.Println("GET Request URL:", u.String())
 
 	result, err := c.getRequest(u.String())
 	if err != nil {
@@ -170,13 +193,16 @@ func (c *APIClient) getRequest(urlStr string) (interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error parsing URL: %w", err)
 	}
-	q := u.Query()
-	q.Set("key", c.APIKey)
-	u.RawQuery = q.Encode()
 
-	// fmt.Println("GET Request URL:", u.String())
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
 
-	resp, err := http.Get(u.String())
+	// Add the X-Goog-User-Project header
+	req.Header.Add("X-Goog-User-Project", c.ProjectID)
+
+	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("error making request: %w", err)
 	}
@@ -184,7 +210,15 @@ func (c *APIClient) getRequest(urlStr string) (interface{}, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		err = fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
+		// Log the request headers on error
+		dump, dumpErr := httputil.DumpRequestOut(req, false)
+		if dumpErr != nil {
+			c.Logger.Printf("Error dumping request: %v", dumpErr)
+		} else {
+			c.Logger.Printf("Request Headers on Error: \n%s", dump)
+		}
+		return nil, err
 	}
 
 	var result interface{}
